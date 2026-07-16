@@ -95,7 +95,7 @@ class AzureCostClientError(RuntimeError):
 
 class AzureCostClient:
     def __init__(self) -> None:
-        self._credential = DefaultAzureCredential(exclude_interactive_browser_credential=True)
+        self._credential: DefaultAzureCredential | None = None
         self._token: str | None = None
         self._token_expires_on: int = 0
         self._http = httpx.Client(timeout=60.0)
@@ -104,6 +104,8 @@ class AzureCostClient:
         now = _dt.datetime.now(_dt.timezone.utc).timestamp()
         if self._token and now < self._token_expires_on - 60:
             return self._token
+        if self._credential is None:
+            self._credential = DefaultAzureCredential(exclude_interactive_browser_credential=True)
         try:
             token = self._credential.get_token(ARM_SCOPE)
         except ClientAuthenticationError as exc:
@@ -173,6 +175,56 @@ class AzureCostClient:
             for i in data.get("value", [])
         ]
 
+    def _get(self, url: str, params: dict | None = None) -> dict[str, Any]:
+        headers = {"Authorization": f"Bearer {self._get_token()}"}
+        resp = self._http.get(url, headers=headers, params=params or {})
+        if not resp.is_success:
+            raise AzureCostClientError(f"Billing API returned {resp.status_code}: {resp.text[:2000]}")
+        return resp.json()
+
+    def get_billing_accounts(self) -> list[dict[str, Any]]:
+        data = self._get(f"{MANAGEMENT_ENDPOINT}/providers/Microsoft.Billing/billingAccounts",
+                         {"api-version": "2020-05-01"})
+        return data.get("value", [])
+
+    def get_billing_periods(self, subscription_id: str, top: int = 12) -> list[dict[str, Any]]:
+        data = self._get(
+            f"{MANAGEMENT_ENDPOINT}/subscriptions/{subscription_id}/providers/Microsoft.Billing/billingPeriods",
+            {"api-version": "2018-03-01-preview", "$top": top},
+        )
+        return data.get("value", [])
+
+    def get_invoices(self, billing_account_name: str, top: int = 12) -> list[dict[str, Any]]:
+        data = self._get(
+            f"{MANAGEMENT_ENDPOINT}/providers/Microsoft.Billing/billingAccounts/{billing_account_name}/invoices",
+            {"api-version": "2020-05-01", "$top": top},
+        )
+        return data.get("value", [])
+
+    def get_usage_details(self, subscription_id: str, start_date: str, end_date: str, top: int = 100) -> list[dict[str, Any]]:
+        data = self._get(
+            f"{MANAGEMENT_ENDPOINT}/subscriptions/{subscription_id}/providers/Microsoft.Consumption/usageDetails",
+            {
+                "api-version": "2023-05-01",
+                "$filter": f"properties/usageStart ge '{start_date}' AND properties/usageEnd le '{end_date}'",
+                "$top": top,
+            },
+        )
+        return data.get("value", [])
+
+    def get_budgets(self, subscription_id: str) -> list[dict[str, Any]]:
+        data = self._get(
+            f"{MANAGEMENT_ENDPOINT}/subscriptions/{subscription_id}/providers/Microsoft.Consumption/budgets",
+            {"api-version": "2023-05-01"},
+        )
+        return data.get("value", [])
+
+    def get_price_sheet(self, subscription_id: str) -> dict[str, Any]:
+        return self._get(
+            f"{MANAGEMENT_ENDPOINT}/subscriptions/{subscription_id}/providers/Microsoft.Consumption/pricesheets/default",
+            {"api-version": "2023-05-01"},
+        )
+
 
 def _parse(raw: dict[str, Any]) -> list[dict[str, Any]]:
     props = raw.get("properties", raw)
@@ -197,9 +249,9 @@ cost_client = AzureCostClient()
 mcp = FastMCP(
     name="Azure Billing",
     instructions=(
-        "Tools for Azure Cost Management (actual spend / cost analysis). "
+        "Tools for Azure Cost Management and Billing APIs (actual spend, invoices, budgets, usage). "
         "All tools are read-only. If the user doesn't specify a subscription, "
-        "call list_subscriptions first."
+        "call list_subscriptions first. For invoice queries, call get_billing_accounts first."
     ),
 )
 
@@ -324,8 +376,73 @@ def get_top_resources_by_cost(
 
 
 # --------------------------------------------------------------------------
-# Entrypoint
+# Billing API tools
 # --------------------------------------------------------------------------
+
+@mcp.tool()
+def get_billing_accounts() -> dict:
+    """List all Azure billing accounts accessible to the service principal."""
+    logger.info("get_billing_accounts called")
+    try:
+        return {"billingAccounts": cost_client.get_billing_accounts()}
+    except AzureCostClientError as exc:
+        return _error(str(exc))
+
+
+@mcp.tool()
+def get_billing_periods(
+    subscription_id: str,
+    top: int = 12,
+) -> dict:
+    """List recent billing periods for a subscription (most recent first)."""
+    logger.info("get_billing_periods called for subscription %s", subscription_id)
+    try:
+        return {"billingPeriods": cost_client.get_billing_periods(subscription_id, top)}
+    except AzureCostClientError as exc:
+        return _error(str(exc))
+
+
+@mcp.tool()
+def get_invoices(
+    billing_account_name: str,
+    top: int = 12,
+) -> dict:
+    """List invoices for a billing account. Call get_billing_accounts first to get the billing account name."""
+    logger.info("get_invoices called for billing account %s", billing_account_name)
+    try:
+        return {"invoices": cost_client.get_invoices(billing_account_name, top)}
+    except AzureCostClientError as exc:
+        return _error(str(exc))
+
+
+@mcp.tool()
+def get_usage_details(
+    subscription_id: str,
+    start_date: str,
+    end_date: str,
+    top: int = 100,
+) -> dict:
+    """
+    Get detailed usage records for a subscription within a date range.
+    start_date / end_date: required, format YYYY-MM-DD.
+    top: max number of records to return (default 100).
+    """
+    logger.info("get_usage_details called for subscription %s (%s to %s)", subscription_id, start_date, end_date)
+    try:
+        return {"usageDetails": cost_client.get_usage_details(subscription_id, start_date, end_date, top)}
+    except AzureCostClientError as exc:
+        return _error(str(exc))
+
+
+@mcp.tool()
+def get_budgets(subscription_id: str) -> dict:
+    """List all cost budgets configured for a subscription, including current spend vs limit."""
+    logger.info("get_budgets called for subscription %s", subscription_id)
+    try:
+        return {"budgets": cost_client.get_budgets(subscription_id)}
+    except AzureCostClientError as exc:
+        return _error(str(exc))
+
 
 # --------------------------------------------------------------------------
 # Entrypoint

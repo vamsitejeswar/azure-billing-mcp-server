@@ -16,31 +16,30 @@
 set -euo pipefail
 
 # --- Fill these in ---
-GCP_REGION="us-central1"
-SERVICE_NAME="azure-billing-mcp"
-SECRET_NAME="cost-mgmt-client-secret"
+GCP_REGION="asia-south1"
+SERVICE_NAME="verse-azure-billing-mcp"
+SECRET_NAME="Azure_secret_value"
+GCP_PROJECT="gemini-project-n1"
 
 # Azure Cost Management service principal identifiers (not secret --
 # these are just IDs, like a username).
-COST_MGMT_TENANT_ID="<tenant-id-of-billing-service-principal>"
-COST_MGMT_CLIENT_ID="<client-id-of-billing-service-principal>"
+COST_MGMT_TENANT_ID="67289332-b388-45bf-9ee0-72164a055698"
+COST_MGMT_CLIENT_ID="30bfa59f-b87d-4313-9363-61e51b9b1b5f"
 # ---------------------
 
-PROJECT_ID=$(gcloud config get-value project)
+PROJECT_ID="${GCP_PROJECT}"
 PROJECT_NUMBER=$(gcloud projects describe "$PROJECT_ID" --format="value(projectNumber)")
+IMAGE="asia-south1-docker.pkg.dev/$PROJECT_ID/cloud-run-source-deploy/$SERVICE_NAME"
 
-# Create the secret with a placeholder if it doesn't exist yet. Edit the
-# real value yourself afterward (console, or `gcloud secrets versions add`
-# -- see CREDENTIALS.md). This script never touches the value once created.
-if ! gcloud secrets describe "$SECRET_NAME" >/dev/null 2>&1; then
-  printf '%s' 'REPLACE_ME' | gcloud secrets create "$SECRET_NAME" --data-file=-
-  echo "Created secret '$SECRET_NAME' with a placeholder value."
-  echo "Edit it with the real Cost Management client secret before relying on this deployment:"
-  echo "  gcloud secrets versions add $SECRET_NAME --data-file=-"
-fi
+# Build and push the container image via Cloud Build
+gcloud builds submit \
+  --tag "$IMAGE" \
+  --project "$PROJECT_ID" \
+  .
 
+# Deploy from the built container image
 gcloud run deploy "$SERVICE_NAME" \
-  --source . \
+  --image "$IMAGE" \
   --region "$GCP_REGION" \
   --no-allow-unauthenticated \
   --set-env-vars "AZURE_TENANT_ID=$COST_MGMT_TENANT_ID,AZURE_CLIENT_ID=$COST_MGMT_CLIENT_ID" \
