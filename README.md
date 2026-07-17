@@ -1,82 +1,169 @@
-# azure-billing-mcp-server
+# Azure Billing MCP Server
 
-MCP server for actual Azure spend / cost analysis via the Azure Cost
-Management Query API. Deployed to Google Cloud Run for use with Gemini
-Enterprise.
+MCP server for Azure spend, cost analysis, and billing via the Azure Cost Management and Billing APIs. Deployed to Google Cloud Run and connected to Gemini Enterprise.
+
+---
 
 ## Architecture
 
 ```
 User in Gemini Enterprise
-        |
-        v
-Gemini Enterprise -> Entra ID OAuth (login.microsoftonline.com)
-        |  receives access token (scope: api://<client-id>/mcp.access)
-        v
-MCP Server (Cloud Run, access gated by IAM -- see GEMINI_SETUP.md)
-  BearerTokenMiddleware captures the token for audit logging only --
+        │
+        ▼
+Gemini Enterprise ──► Entra ID OAuth (login.microsoftonline.com)
+        │  receives access token (scope: api://<client-id>/mcp.access)
+        ▼
+MCP Server on Cloud Run  (access gated by Cloud Run IAM)
+  BearerTokenMiddleware captures the token for audit logging only —
   it is NOT forwarded to Azure (wrong audience for management.azure.com)
-        |
-        v
-  Server's own service principal credentials -> Azure Cost Management API
-        |
-        v
-Response back to Gemini -> User
+        │
+        ▼
+  Server's own service principal ──► Azure Cost Management + Billing APIs
+        │
+        ▼
+Response back to Gemini Enterprise ──► User
 ```
 
-This is a deliberate difference from a same-app OAuth setup (where the
-forwarded token would be directly reusable against the downstream API):
-here the Entra app used for login and the service principal used for
-billing data are two separate identities, so the incoming token is logged
-for visibility but never used to call Azure. See `GEMINI_SETUP.md` for the
-full reasoning.
+> The Entra ID app used for GE login and the service principal used for billing are **two separate identities**. The incoming token is logged for visibility but never used to call Azure.
+
+---
 
 ## Files
 
 ```
-server.py           # everything: FastMCP app, Azure Cost Management client,
-                     # all 6 tools, and the entrypoint -- one file on purpose
+server.py            # FastMCP app, Azure client, all 11 tools, entrypoint
 requirements.txt
 Dockerfile
-deploy_cloudrun.sh   # deploy + IAM grant + placeholder secret creation
-.env.example         # for local runs
-CREDENTIALS.md       # Azure Cost Management service principal setup/rotation
-GEMINI_SETUP.md       # OAuth fields, IAM grant, troubleshooting for Gemini Enterprise
+deploy_cloudrun.sh   # build image, deploy to Cloud Run, grant IAM
+.env.example         # for local development
+SETUP.md             # complete step-by-step setup guide for clients
 ```
 
-## Tools
+---
 
-`list_subscriptions`, `query_costs`, `get_cost_by_service`,
-`get_cost_by_resource_group`, `get_daily_cost_trend`, `get_top_resources_by_cost`
+## Tools (11 total)
 
-## Two separate credentials -- don't confuse them
+### Cost Management
+| Tool | Description |
+|---|---|
+| `list_subscriptions` | List all accessible Azure subscriptions |
+| `query_costs` | General-purpose cost query (timeframe, granularity, grouping) |
+| `get_cost_by_service` | Cost breakdown by Azure service |
+| `get_cost_by_resource_group` | Cost breakdown by resource group |
+| `get_daily_cost_trend` | Day-by-day cost time series |
+| `get_top_resources_by_cost` | Top N most expensive resources |
 
-- **Entra ID app (`gemini-enterprise-mcp`)** -- only for Gemini Enterprise's
-  OAuth consent screen. See `GEMINI_SETUP.md`.
-- **Azure Cost Management service principal** -- what this server actually
-  uses to query Azure. See `CREDENTIALS.md`.
+### Billing API
+| Tool | Description |
+|---|---|
+| `get_billing_accounts` | List billing accounts |
+| `get_billing_periods` | List billing periods history |
+| `get_invoices` | List invoices for a billing account |
+| `get_usage_details` | Detailed usage records by date range |
+| `get_budgets` | Budget limits and current spend vs limit |
 
-Who's allowed to *call* this server is Cloud Run IAM, not an in-app token
-check -- see `GEMINI_SETUP.md` for why.
+All tools are **read-only** (`readOnlyHint=True`).
 
-## Local development
+---
+
+## Two Separate Credentials
+
+| Credential | Purpose | Used by |
+|---|---|---|
+| **Azure service principal** (`AZURE_CLIENT_ID`) | Queries Azure billing APIs | The MCP server itself |
+| **Entra ID app registration** (`gemini-enterprise-mcp`) | OAuth login screen for GE | Gemini Enterprise |
+
+Do NOT mix these up — they serve different roles.
+
+---
+
+## Gemini Enterprise Setup
+
+### MCP Server URL
+```
+https://<your-cloud-run-url>/mcp
+```
+Printed by `deploy_cloudrun.sh` after deploy.
+
+### Authentication Settings (fill in GE form)
+
+| Field | Value |
+|---|---|
+| **MCP Server URL** | `https://<cloud-run-url>/mcp` |
+| **Authorization URL** | `https://login.microsoftonline.com/<TENANT_ID>/oauth2/v2.0/authorize` |
+| **Token URL** | `https://login.microsoftonline.com/<TENANT_ID>/oauth2/v2.0/token` |
+| **Client ID** | Application (client) ID of `gemini-enterprise-mcp` app |
+| **Client Secret** | Secret from `gemini-enterprise-mcp` app — NOT the service principal secret |
+| **Scopes** | `api://<client-id>/mcp.access offline_access` |
+| **Enable PKCE** | Leave unchecked |
+
+### MCP Agent Instructions (paste into GE)
+```
+You have access to Azure Cost Management and Billing tools for querying actual
+Azure spend, invoices, budgets, and usage. All tools are read-only.
+If the user doesn't specify a subscription, call list_subscriptions first.
+For invoice queries, call get_billing_accounts first.
+Default timeframe is "MonthToDate" unless the user asks for a different period.
+```
+
+### Required Redirect URIs (add in Entra ID App Registration → Authentication)
+```
+https://vertexaisearch.cloud.google.com/console/oauth/default_oauth.html
+https://vertexaisearch.cloud.google.com/oauth-redirect
+```
+
+---
+
+## Local Development
 
 ```bash
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # fill in the three AZURE_* values
-python server.py        # http://0.0.0.0:8000/mcp
+cp .env.example .env   # fill in AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET
+python server.py        # runs at http://0.0.0.0:8080/mcp
 ```
 
-## Deploy
+---
+
+## Deploy to Cloud Run
 
 ```bash
-gcloud auth login
-gcloud config set project <your-gcp-project-id>
-gcloud services enable run.googleapis.com secretmanager.googleapis.com discoveryengine.googleapis.com
-# edit the identifiers at the top of deploy_cloudrun.sh, then:
+# 1. Fill in deploy_cloudrun.sh variables:
+#    GCP_PROJECT, COST_MGMT_TENANT_ID, COST_MGMT_CLIENT_ID
+
+# 2. Store the Azure client secret in Secret Manager:
+printf '%s' 'YOUR_SECRET' | gcloud secrets create Azure_secret_value \
+  --project <your-gcp-project-id> --data-file=-
+
+# 3. Deploy:
 bash deploy_cloudrun.sh
 ```
 
-Then follow `GEMINI_SETUP.md` for the Entra ID app registration and the
-values to paste into Gemini Enterprise's data store form.
+> For the full step-by-step client setup guide including Azure Portal screenshots, see **SETUP.md**.
+
+---
+
+## Subscription Type Requirement
+
+The Cost Management and Billing APIs require a **paid commercial** Azure subscription:
+
+| ✅ Works | ❌ Does NOT work |
+|---|---|
+| Pay-As-You-Go | Free Trial |
+| Enterprise Agreement (EA) | Visual Studio / Dev/Test |
+| Microsoft Customer Agreement (MCA) | CSP / Sponsored |
+
+---
+
+## Troubleshooting
+
+| Error | Cause | Fix |
+|---|---|---|
+| `Failed to obtain refresh token` | Wrong Client Secret in GE form | Use the `gemini-enterprise-mcp` secret, not the service principal secret |
+| `Failed to load actions` in GE | Cloud Run server not starting | Re-grant Secret Manager permission to the compute service account |
+| `doesn't have valid WebDirect/AIRS offer type` | Free Trial subscription | Upgrade to Pay-As-You-Go |
+| `Invalid tenant ID` on startup | Placeholder credentials in deploy script | Fill in real `COST_MGMT_TENANT_ID` and `COST_MGMT_CLIENT_ID` |
+| `Permission denied on secret` | Cloud Run SA lacks Secret Manager access | Run `gcloud secrets add-iam-policy-binding` for the compute SA |
+| `403 Forbidden` | GE service account missing invoker role | Re-run the IAM grant in `deploy_cloudrun.sh` |
+| `AuthorizationFailed` on billing tools | Missing Billing Reader role | Assign `Billing Reader` role to the service principal in Azure Portal |
+| Tools return empty `[]` | Service principal has no subscription access | Assign `Cost Management Reader` role using the service principal's Object ID |
