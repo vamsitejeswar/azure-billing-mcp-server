@@ -29,6 +29,7 @@ from azure.core.exceptions import ClientAuthenticationError
 from azure.identity import DefaultAzureCredential
 from dotenv import load_dotenv
 from fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 
@@ -256,11 +257,14 @@ mcp = FastMCP(
 )
 
 
+_R = ToolAnnotations(readOnlyHint=True)
+
+
 def _error(msg: str) -> dict:
     return {"error": msg}
 
 
-@mcp.tool()
+@mcp.tool(annotations=_R)
 def list_subscriptions() -> dict:
     """List Azure subscriptions the service principal can access."""
     logger.info("list_subscriptions called (caller token present: %s)", bool(current_token.get()))
@@ -270,7 +274,7 @@ def list_subscriptions() -> dict:
         return _error(str(exc))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_R)
 def query_costs(
     subscription_id: str,
     resource_group: str | None = None,
@@ -299,7 +303,7 @@ def query_costs(
     return {"rows": _round_costs(_parse(raw))}
 
 
-@mcp.tool()
+@mcp.tool(annotations=_R)
 def get_cost_by_service(
     subscription_id: str,
     resource_group: str | None = None,
@@ -318,7 +322,7 @@ def get_cost_by_service(
     return {"rows": rows}
 
 
-@mcp.tool()
+@mcp.tool(annotations=_R)
 def get_cost_by_resource_group(
     subscription_id: str,
     timeframe: str = "MonthToDate",
@@ -336,7 +340,7 @@ def get_cost_by_resource_group(
     return {"rows": rows}
 
 
-@mcp.tool()
+@mcp.tool(annotations=_R)
 def get_daily_cost_trend(
     subscription_id: str,
     resource_group: str | None = None,
@@ -355,7 +359,7 @@ def get_daily_cost_trend(
     return {"rows": rows}
 
 
-@mcp.tool()
+@mcp.tool(annotations=_R)
 def get_top_resources_by_cost(
     subscription_id: str,
     resource_group: str | None = None,
@@ -379,7 +383,7 @@ def get_top_resources_by_cost(
 # Billing API tools
 # --------------------------------------------------------------------------
 
-@mcp.tool()
+@mcp.tool(annotations=_R)
 def get_billing_accounts() -> dict:
     """List all Azure billing accounts accessible to the service principal."""
     logger.info("get_billing_accounts called")
@@ -389,7 +393,7 @@ def get_billing_accounts() -> dict:
         return _error(str(exc))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_R)
 def get_billing_periods(
     subscription_id: str,
     top: int = 12,
@@ -402,7 +406,7 @@ def get_billing_periods(
         return _error(str(exc))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_R)
 def get_invoices(
     billing_account_name: str,
     top: int = 12,
@@ -415,7 +419,7 @@ def get_invoices(
         return _error(str(exc))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_R)
 def get_usage_details(
     subscription_id: str,
     start_date: str,
@@ -434,7 +438,7 @@ def get_usage_details(
         return _error(str(exc))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_R)
 def get_budgets(subscription_id: str) -> dict:
     """List all cost budgets configured for a subscription, including current spend vs limit."""
     logger.info("get_budgets called for subscription %s", subscription_id)

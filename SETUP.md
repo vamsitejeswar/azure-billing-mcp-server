@@ -300,3 +300,24 @@ To upgrade: **Azure Portal → Subscriptions → select your subscription → Up
 | `Permission denied on secret` | Cloud Run can't read the secret | Re-run the `add-iam-policy-binding` command from Step 4.1 |
 | `AuthorizationFailed` on billing tools | Missing Billing Reader role | Assign `Billing Reader` role in Azure Portal (Step 2.2) |
 | Tools return empty results `[]` | Service principal has no subscription access | Assign roles in Step 2 using the correct Object ID |
+
+
+❯ 9e4fd41f-6b39-4a5d-b9c0-19dc460c893e
+
+Let me assign the role using the REST API.
+
+  Ran 1 shell command
+
+The service principal can't assign its own roles — it needs an Azure admin to do it. But I got the Object ID from the error. Here are the exact portal steps:
+
+Object ID of the service principal: 3acf5006-50c4-4d82-9c72-542b74abf476
+
+---
+Do this in Azure Portal:
+
+1. Go to portal.azure.com → Subscriptions → 9e4fd41f-6b39-4a5d-b9c0-19dc460c893e
+2. Click Access control (IAM) → Add → Add role assignment
+3. Role tab → search Cost Management Reader → select it → Next
+4. Members tab → Select members → paste this Object ID:
+3acf5006-50c4-4d82-9c72-542b74abf476
+5. Review + assign
