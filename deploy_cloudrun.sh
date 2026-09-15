@@ -16,15 +16,16 @@
 set -euo pipefail
 
 # --- Fill these in ---
-GCP_REGION="asia-south1"
-SERVICE_NAME="verse-azure-billing-mcp"
-SECRET_NAME="Azure_secret_value"
-GCP_PROJECT="gemini-project-n1"
+GCP_REGION="asia-south1"               # Change if your Cloud Run region differs
+SERVICE_NAME="azure-billing-mcp"       # Cloud Run service name (client-specific)
+SECRET_NAME="Azure_secret_value"       # Must match the secret name in GCP Secret Manager (Step 4 of SETUP.md)
+GCP_PROJECT="<your-gcp-project-id>"   # Your GCP project ID
 
-# Azure Cost Management service principal identifiers (not secret --
-# these are just IDs, like a username).
-COST_MGMT_TENANT_ID="67289332-b388-45bf-9ee0-72164a055698"
-COST_MGMT_CLIENT_ID="30bfa59f-b87d-4313-9363-61e51b9b1b5f"
+# Azure Cost Management service principal identifiers.
+# These are the AZURE_TENANT_ID and AZURE_CLIENT_ID from Step 1.2 of SETUP.md.
+# They are identifiers (like a username), not secrets — the actual secret is in GCP Secret Manager above.
+COST_MGMT_TENANT_ID="<your-azure-tenant-id>"
+COST_MGMT_CLIENT_ID="<your-azure-client-id>"
 # ---------------------
 
 PROJECT_ID="${GCP_PROJECT}"

@@ -196,7 +196,7 @@ Open the file and update these lines:
 
 ```bash
 GCP_REGION="asia-south1"
-SERVICE_NAME="verse-azure-billing-mcp"
+SERVICE_NAME="<your-service-name>"         # e.g. azure-billing-mcp
 SECRET_NAME="Azure_secret_value"
 GCP_PROJECT="<your-gcp-project-id>"
 COST_MGMT_TENANT_ID="<AZURE_TENANT_ID from Step 1.2>"
@@ -211,7 +211,7 @@ bash deploy_cloudrun.sh
 
 At the end it prints the MCP Server URL:
 ```
-Deployed. MCP Server URL for Gemini Enterprise: https://verse-azure-billing-mcp-xxxx.asia-south1.run.app/mcp
+Deployed. MCP Server URL for Gemini Enterprise: https://<your-service-name>-xxxx.asia-south1.run.app/mcp
 ```
 
 **Save this URL** — you need it in Step 6.
@@ -300,24 +300,3 @@ To upgrade: **Azure Portal → Subscriptions → select your subscription → Up
 | `Permission denied on secret` | Cloud Run can't read the secret | Re-run the `add-iam-policy-binding` command from Step 4.1 |
 | `AuthorizationFailed` on billing tools | Missing Billing Reader role | Assign `Billing Reader` role in Azure Portal (Step 2.2) |
 | Tools return empty results `[]` | Service principal has no subscription access | Assign roles in Step 2 using the correct Object ID |
-
-
-❯ 9e4fd41f-6b39-4a5d-b9c0-19dc460c893e
-
-Let me assign the role using the REST API.
-
-  Ran 1 shell command
-
-The service principal can't assign its own roles — it needs an Azure admin to do it. But I got the Object ID from the error. Here are the exact portal steps:
-
-Object ID of the service principal: 3acf5006-50c4-4d82-9c72-542b74abf476
-
----
-Do this in Azure Portal:
-
-1. Go to portal.azure.com → Subscriptions → 9e4fd41f-6b39-4a5d-b9c0-19dc460c893e
-2. Click Access control (IAM) → Add → Add role assignment
-3. Role tab → search Cost Management Reader → select it → Next
-4. Members tab → Select members → paste this Object ID:
-3acf5006-50c4-4d82-9c72-542b74abf476
-5. Review + assign

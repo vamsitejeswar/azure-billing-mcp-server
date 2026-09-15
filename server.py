@@ -6,11 +6,11 @@ single small service, not worth splitting into a package.
 Auth model:
   - Who can CALL this server at all: Cloud Run IAM (--no-allow-unauthenticated
     + granting Gemini Enterprise's own service account roles/run.invoker).
-    See GEMINI_SETUP.md. This file does not validate an inbound OAuth token.
+    See SETUP.md. This file does not validate an inbound OAuth token.
   - Who this server queries AZURE as: a separate, fixed service principal
     (AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET below), picked
     up automatically by azure-identity's DefaultAzureCredential. Needs the
-    "Cost Management Reader" role. See CREDENTIALS.md.
+    "Cost Management Reader" role. See SETUP.md.
 
 Run locally:   python server.py
 Run in Docker: see Dockerfile (CMD ["python", "server.py"])
