@@ -18,14 +18,21 @@ set -euo pipefail
 # --- Fill these in ---
 GCP_REGION="asia-south1"               # Change if your Cloud Run region differs
 SERVICE_NAME="azure-billing-mcp"       # Cloud Run service name (client-specific)
-SECRET_NAME="Azure_secret_value"       # Must match the secret name in GCP Secret Manager (Step 4 of SETUP.md)
 GCP_PROJECT="<your-gcp-project-id>"   # Your GCP project ID
 
-# Azure Cost Management service principal identifiers.
-# These are the AZURE_TENANT_ID and AZURE_CLIENT_ID from Step 1.2 of SETUP.md.
-# They are identifiers (like a username), not secrets — the actual secret is in GCP Secret Manager above.
-COST_MGMT_TENANT_ID="<your-azure-tenant-id>"
-COST_MGMT_CLIENT_ID="<your-azure-client-id>"
+# --- Tenant 1 (primary) ---
+# Billing service principal for the first Azure tenant (SETUP.md Steps 1-2).
+# The actual client secret is stored in GCP Secret Manager, not here.
+SECRET_NAME="Azure_secret_value"                 # Secret Manager secret name for tenant 1
+COST_MGMT_TENANT_ID="<your-azure-tenant-id>"    # AZURE_TENANT_ID from Step 1.2
+COST_MGMT_CLIENT_ID="<your-azure-client-id>"    # AZURE_CLIENT_ID from Step 1.2
+
+# --- Tenant 2 (secondary — e.g. client/Magzter tenant) ---
+# Leave blank ("") to disable. When set, requests from this tenant's users are
+# automatically routed to these credentials.
+SECRET_NAME_2="Azure_secret_value_2"              # Secret Manager secret name for tenant 2
+COST_MGMT_TENANT_ID_2="<second-azure-tenant-id>" # AZURE_TENANT_ID of the second tenant
+COST_MGMT_CLIENT_ID_2="<second-azure-client-id>" # AZURE_CLIENT_ID of the second tenant
 # ---------------------
 
 PROJECT_ID="${GCP_PROJECT}"
@@ -43,8 +50,8 @@ gcloud run deploy "$SERVICE_NAME" \
   --image "$IMAGE" \
   --region "$GCP_REGION" \
   --no-allow-unauthenticated \
-  --set-env-vars "AZURE_TENANT_ID=$COST_MGMT_TENANT_ID,AZURE_CLIENT_ID=$COST_MGMT_CLIENT_ID" \
-  --set-secrets "AZURE_CLIENT_SECRET=$SECRET_NAME:latest"
+  --set-env-vars "AZURE_TENANT_ID=$COST_MGMT_TENANT_ID,AZURE_CLIENT_ID=$COST_MGMT_CLIENT_ID,AZURE_TENANT_ID_2=$COST_MGMT_TENANT_ID_2,AZURE_CLIENT_ID_2=$COST_MGMT_CLIENT_ID_2" \
+  --set-secrets "AZURE_CLIENT_SECRET=$SECRET_NAME:latest,AZURE_CLIENT_SECRET_2=$SECRET_NAME_2:latest"
 
 # Grant Gemini Enterprise's own Google service account permission to invoke
 # this service -- this, not an app-level token check, is what restricts

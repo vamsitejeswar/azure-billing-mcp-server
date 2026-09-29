@@ -7,10 +7,12 @@ Auth model:
   - Who can CALL this server at all: Cloud Run IAM (--no-allow-unauthenticated
     + granting Gemini Enterprise's own service account roles/run.invoker).
     See SETUP.md. This file does not validate an inbound OAuth token.
-  - Who this server queries AZURE as: a separate, fixed service principal
-    (AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET below), picked
-    up automatically by azure-identity's DefaultAzureCredential. Needs the
-    "Cost Management Reader" role. See SETUP.md.
+  - Who this server queries AZURE as: one or more service principals, one per
+    tenant, configured via AZURE_TENANT_ID / AZURE_CLIENT_ID /
+    AZURE_CLIENT_SECRET (and optionally _2 suffixed variants for additional
+    tenants). The bearer token Gemini Enterprise forwards carries a "tid"
+    (tenant) claim; the server decodes it to pick the matching credential set.
+    See SETUP.md and docs/CONFIGURATION.md.
 
 Run locally:   python server.py
 Run in Docker: see Dockerfile (CMD ["python", "server.py"])
@@ -18,15 +20,18 @@ Run in Docker: see Dockerfile (CMD ["python", "server.py"])
 
 from __future__ import annotations
 
+import base64
 import datetime as _dt
+import json
 import logging
 import os
+import time
 from contextvars import ContextVar
 from typing import Any
 
 import httpx
 from azure.core.exceptions import ClientAuthenticationError
-from azure.identity import DefaultAzureCredential
+from azure.identity import ClientSecretCredential, DefaultAzureCredential
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 from mcp.types import ToolAnnotations
@@ -42,38 +47,44 @@ logging.basicConfig(
 logger = logging.getLogger("azure-billing-mcp")
 
 # --------------------------------------------------------------------------
-# Bearer token capture (audit/logging only -- see note below)
+# Bearer token capture + tenant routing
 # --------------------------------------------------------------------------
-#
-# Set by BearerTokenMiddleware on every incoming HTTP request, same pattern
-# as the ManageEngine reference server. IMPORTANT DIFFERENCE from that
-# server: there, the forwarded token was a valid Zoho token usable directly
-# against the Zoho API, so it was used as a per-request override. Here, the
-# token Gemini Enterprise forwards is an Entra ID token scoped to this
-# server's own custom scope (api://<client-id>/mcp.access) -- it is NOT
-# valid against Azure's management API (wrong audience: Azure expects
-# https://management.azure.com/.default), so it CANNOT be forwarded to
-# Azure. It's captured here only so tool calls can log which caller
-# triggered them (decoded, not cryptographically verified -- verification
-# isn't this server's job; Cloud Run IAM already gates who can call it at
-# all). Every Azure call still always uses the server's own service
-# principal credentials below, regardless of what's captured here.
+
 current_token: ContextVar[str] = ContextVar("current_token", default="")
+current_tenant: ContextVar[str] = ContextVar("current_tenant", default="")
+
+
+def _decode_tenant(token: str) -> str:
+    """Extract the 'tid' claim from a JWT without verifying the signature."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        return claims.get("tid", "")
+    except Exception:
+        return ""
 
 
 class BearerTokenMiddleware(BaseHTTPMiddleware):
-    """Captures the incoming Bearer token (if any) for audit logging only."""
+    """Captures the incoming Bearer token and decodes its tenant for routing."""
 
     async def dispatch(self, request, call_next):
         auth = request.headers.get("authorization", "")
         token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
-        ctx_var = current_token.set(token)
+        tenant = _decode_tenant(token) if token else ""
+        ctx_token = current_token.set(token)
+        ctx_tenant = current_tenant.set(tenant)
         if token:
-            logger.info("Request with bearer token present (len=%d)", len(token))
+            logger.info(
+                "Request with bearer token (len=%d, tenant=%s)",
+                len(token), tenant or "unknown",
+            )
         try:
             return await call_next(request)
         finally:
-            current_token.reset(ctx_var)
+            current_token.reset(ctx_token)
+            current_tenant.reset(ctx_tenant)
+
 
 # --------------------------------------------------------------------------
 # Azure Cost Management client
@@ -95,8 +106,17 @@ class AzureCostClientError(RuntimeError):
 
 
 class AzureCostClient:
-    def __init__(self) -> None:
-        self._credential: DefaultAzureCredential | None = None
+    def __init__(
+        self,
+        tenant_id: str | None = None,
+        client_id: str | None = None,
+        client_secret: str | None = None,
+    ) -> None:
+        if tenant_id and client_id and client_secret:
+            self._credential = ClientSecretCredential(tenant_id, client_id, client_secret)
+        else:
+            # Fallback for local dev: picks up `az login` or env vars automatically
+            self._credential = DefaultAzureCredential(exclude_interactive_browser_credential=True)
         self._token: str | None = None
         self._token_expires_on: int = 0
         self._http = httpx.Client(timeout=60.0)
@@ -105,15 +125,12 @@ class AzureCostClient:
         now = _dt.datetime.now(_dt.timezone.utc).timestamp()
         if self._token and now < self._token_expires_on - 60:
             return self._token
-        if self._credential is None:
-            self._credential = DefaultAzureCredential(exclude_interactive_browser_credential=True)
         try:
             token = self._credential.get_token(ARM_SCOPE)
         except ClientAuthenticationError as exc:
             raise AzureCostClientError(
-                "Failed to authenticate to Azure. Check AZURE_TENANT_ID / "
-                "AZURE_CLIENT_ID / AZURE_CLIENT_SECRET (or run `az login` "
-                f"for local testing). Underlying error: {exc}"
+                "Failed to authenticate to Azure. Check credentials. "
+                f"Underlying error: {exc}"
             ) from exc
         self._token = token.token
         self._token_expires_on = token.expires_on
@@ -125,6 +142,31 @@ class AzureCostClient:
         if resource_group:
             scope += f"/resourceGroups/{resource_group}"
         return scope
+
+    def _request_with_retry(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict,
+        params: dict | None = None,
+        json_body: dict | None = None,
+        max_retries: int = 2,
+    ) -> httpx.Response:
+        for attempt in range(max_retries + 1):
+            if method == "POST":
+                resp = self._http.post(url, headers=headers, params=params or {}, json=json_body)
+            else:
+                resp = self._http.get(url, headers=headers, params=params or {})
+            if resp.status_code != 429 or attempt == max_retries:
+                return resp
+            wait = min(int(resp.headers.get("Retry-After", "15")), 60)
+            logger.warning(
+                "Azure API rate-limited (429) — waiting %ds before retry %d/%d",
+                wait, attempt + 1, max_retries,
+            )
+            time.sleep(wait)
+        raise AzureCostClientError("Exhausted retries after repeated 429 responses from Azure API")
 
     def query_costs(
         self,
@@ -159,7 +201,10 @@ class AzureCostClient:
 
         url = f"{MANAGEMENT_ENDPOINT}{scope}/providers/Microsoft.CostManagement/query"
         headers = {"Authorization": f"Bearer {self._get_token()}", "Content-Type": "application/json"}
-        resp = self._http.post(url, headers=headers, params={"api-version": COST_MGMT_API_VERSION}, json=body)
+        resp = self._request_with_retry(
+            "POST", url, headers=headers,
+            params={"api-version": COST_MGMT_API_VERSION}, json_body=body,
+        )
         if not resp.is_success:
             raise AzureCostClientError(f"Cost Management API returned {resp.status_code}: {resp.text[:2000]}")
         return resp.json()
@@ -178,7 +223,7 @@ class AzureCostClient:
 
     def _get(self, url: str, params: dict | None = None) -> dict[str, Any]:
         headers = {"Authorization": f"Bearer {self._get_token()}"}
-        resp = self._http.get(url, headers=headers, params=params or {})
+        resp = self._request_with_retry("GET", url, headers=headers, params=params)
         if not resp.is_success:
             raise AzureCostClientError(f"Billing API returned {resp.status_code}: {resp.text[:2000]}")
         return resp.json()
@@ -241,7 +286,41 @@ def _round_costs(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return rows
 
 
-cost_client = AzureCostClient()
+# --------------------------------------------------------------------------
+# Per-tenant client registry
+# Reads up to two credential sets from env vars (suffix "" and "_2").
+# Keys are Azure tenant IDs so each request is routed to the right credentials.
+# --------------------------------------------------------------------------
+
+_clients: dict[str, AzureCostClient] = {}
+
+
+def _register_tenant(suffix: str = "") -> None:
+    t = os.environ.get(f"AZURE_TENANT_ID{suffix}")
+    c = os.environ.get(f"AZURE_CLIENT_ID{suffix}")
+    s = os.environ.get(f"AZURE_CLIENT_SECRET{suffix}")
+    if t and c and s:
+        _clients[t] = AzureCostClient(t, c, s)
+        logger.info("Registered Azure credentials for tenant %s", t)
+
+
+_register_tenant("")    # primary:   AZURE_TENANT_ID  / AZURE_CLIENT_ID  / AZURE_CLIENT_SECRET
+_register_tenant("_2")  # secondary: AZURE_TENANT_ID_2 / AZURE_CLIENT_ID_2 / AZURE_CLIENT_SECRET_2
+
+# Local dev fallback: if no env vars are set, use DefaultAzureCredential (az login)
+_fallback_client: AzureCostClient | None = AzureCostClient() if not _clients else None
+if _fallback_client:
+    logger.warning("No explicit Azure credentials found — using DefaultAzureCredential (local dev only)")
+
+
+def _get_client() -> AzureCostClient:
+    """Return the AzureCostClient matching the current request's tenant, or fallback."""
+    if _clients:
+        tenant = current_tenant.get()
+        return _clients.get(tenant) or next(iter(_clients.values()))
+    assert _fallback_client is not None
+    return _fallback_client
+
 
 # --------------------------------------------------------------------------
 # MCP server + tools
@@ -256,7 +335,6 @@ mcp = FastMCP(
     ),
 )
 
-
 _R = ToolAnnotations(readOnlyHint=True)
 
 
@@ -267,9 +345,9 @@ def _error(msg: str) -> dict:
 @mcp.tool(annotations=_R)
 def list_subscriptions() -> dict:
     """List Azure subscriptions the service principal can access."""
-    logger.info("list_subscriptions called (caller token present: %s)", bool(current_token.get()))
+    logger.info("list_subscriptions called (tenant=%s)", current_tenant.get() or "unknown")
     try:
-        return {"subscriptions": cost_client.list_subscriptions()}
+        return {"subscriptions": _get_client().list_subscriptions()}
     except AzureCostClientError as exc:
         return _error(str(exc))
 
@@ -296,8 +374,9 @@ def query_costs(
     start_date / end_date: required (YYYY-MM-DD) only when timeframe="Custom".
     """
     try:
-        scope = cost_client.build_scope(subscription_id, resource_group)
-        raw = cost_client.query_costs(scope, timeframe, granularity, group_by, start_date, end_date, cost_type)
+        client = _get_client()
+        scope = client.build_scope(subscription_id, resource_group)
+        raw = client.query_costs(scope, timeframe, granularity, group_by, start_date, end_date, cost_type)
     except (AzureCostClientError, ValueError) as exc:
         return _error(str(exc))
     return {"rows": _round_costs(_parse(raw))}
@@ -313,8 +392,9 @@ def get_cost_by_service(
 ) -> dict:
     """Break down actual Azure spend by service for the given period."""
     try:
-        scope = cost_client.build_scope(subscription_id, resource_group)
-        raw = cost_client.query_costs(scope, timeframe, "None", ["ServiceName"], start_date, end_date)
+        client = _get_client()
+        scope = client.build_scope(subscription_id, resource_group)
+        raw = client.query_costs(scope, timeframe, "None", ["ServiceName"], start_date, end_date)
     except (AzureCostClientError, ValueError) as exc:
         return _error(str(exc))
     rows = _round_costs(_parse(raw))
@@ -331,8 +411,9 @@ def get_cost_by_resource_group(
 ) -> dict:
     """Break down actual Azure spend by resource group for the given period."""
     try:
-        scope = cost_client.build_scope(subscription_id)
-        raw = cost_client.query_costs(scope, timeframe, "None", ["ResourceGroupName"], start_date, end_date)
+        client = _get_client()
+        scope = client.build_scope(subscription_id)
+        raw = client.query_costs(scope, timeframe, "None", ["ResourceGroupName"], start_date, end_date)
     except (AzureCostClientError, ValueError) as exc:
         return _error(str(exc))
     rows = _round_costs(_parse(raw))
@@ -350,8 +431,9 @@ def get_daily_cost_trend(
 ) -> dict:
     """Day-by-day actual cost time series for the given period."""
     try:
-        scope = cost_client.build_scope(subscription_id, resource_group)
-        raw = cost_client.query_costs(scope, timeframe, "Daily", None, start_date, end_date)
+        client = _get_client()
+        scope = client.build_scope(subscription_id, resource_group)
+        raw = client.query_costs(scope, timeframe, "Daily", None, start_date, end_date)
     except (AzureCostClientError, ValueError) as exc:
         return _error(str(exc))
     rows = _round_costs(_parse(raw))
@@ -370,8 +452,9 @@ def get_top_resources_by_cost(
 ) -> dict:
     """Most expensive individual resources for the given period, highest first."""
     try:
-        scope = cost_client.build_scope(subscription_id, resource_group)
-        raw = cost_client.query_costs(scope, timeframe, "None", ["ResourceId"], start_date, end_date)
+        client = _get_client()
+        scope = client.build_scope(subscription_id, resource_group)
+        raw = client.query_costs(scope, timeframe, "None", ["ResourceId"], start_date, end_date)
     except (AzureCostClientError, ValueError) as exc:
         return _error(str(exc))
     rows = _round_costs(_parse(raw))
@@ -386,9 +469,9 @@ def get_top_resources_by_cost(
 @mcp.tool(annotations=_R)
 def get_billing_accounts() -> dict:
     """List all Azure billing accounts accessible to the service principal."""
-    logger.info("get_billing_accounts called")
+    logger.info("get_billing_accounts called (tenant=%s)", current_tenant.get() or "unknown")
     try:
-        return {"billingAccounts": cost_client.get_billing_accounts()}
+        return {"billingAccounts": _get_client().get_billing_accounts()}
     except AzureCostClientError as exc:
         return _error(str(exc))
 
@@ -401,7 +484,7 @@ def get_billing_periods(
     """List recent billing periods for a subscription (most recent first)."""
     logger.info("get_billing_periods called for subscription %s", subscription_id)
     try:
-        return {"billingPeriods": cost_client.get_billing_periods(subscription_id, top)}
+        return {"billingPeriods": _get_client().get_billing_periods(subscription_id, top)}
     except AzureCostClientError as exc:
         return _error(str(exc))
 
@@ -414,7 +497,7 @@ def get_invoices(
     """List invoices for a billing account. Call get_billing_accounts first to get the billing account name."""
     logger.info("get_invoices called for billing account %s", billing_account_name)
     try:
-        return {"invoices": cost_client.get_invoices(billing_account_name, top)}
+        return {"invoices": _get_client().get_invoices(billing_account_name, top)}
     except AzureCostClientError as exc:
         return _error(str(exc))
 
@@ -433,7 +516,7 @@ def get_usage_details(
     """
     logger.info("get_usage_details called for subscription %s (%s to %s)", subscription_id, start_date, end_date)
     try:
-        return {"usageDetails": cost_client.get_usage_details(subscription_id, start_date, end_date, top)}
+        return {"usageDetails": _get_client().get_usage_details(subscription_id, start_date, end_date, top)}
     except AzureCostClientError as exc:
         return _error(str(exc))
 
@@ -443,7 +526,7 @@ def get_budgets(subscription_id: str) -> dict:
     """List all cost budgets configured for a subscription, including current spend vs limit."""
     logger.info("get_budgets called for subscription %s", subscription_id)
     try:
-        return {"budgets": cost_client.get_budgets(subscription_id)}
+        return {"budgets": _get_client().get_budgets(subscription_id)}
     except AzureCostClientError as exc:
         return _error(str(exc))
 
